@@ -18,8 +18,8 @@ st.set_page_config(
     layout="wide",
 )
 
-# Automatic refresh every 5 seconds
-st_autorefresh(interval=5000, key="data_refresh")
+# Automatic refresh every 30 seconds
+st_autorefresh(interval=30000, key="data_refresh")
 
 # Render the sidebar
 render_sidebar()

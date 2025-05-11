@@ -1,4 +1,4 @@
-import pandas as pd
+import pandas as pd 
 import streamlit as st
 import plotly.graph_objs as go
 import time
@@ -10,315 +10,193 @@ from utils.sidebar import render_sidebar
 # Utility Function for Manual Ranges
 # ---------------------------
 def axis_range(series, padding_ratio=0.1, min_padding=0.5):
-    """
-    Returns a [min, max] range for the given series,
-    with some padding to avoid the trace hitting the border.
-    """
     if series.empty:
-        # If no data, return a default range
         return [0, 1]
-    val_min = float(series.min())
-    val_max = float(series.max())
-    if val_min == val_max:
-        # If data is constant or near-constant, pick an arbitrary small range
-        return [val_min - 1, val_min + 1]
-    
-    span = val_max - val_min
-    padding = max(span * padding_ratio, min_padding)
-    return [val_min - padding, val_max + padding]
+    vmin, vmax = series.min(), series.max()
+    if vmin == vmax:
+        return [vmin - 1, vmax + 1]
+    span = vmax - vmin
+    pad = max(span * padding_ratio, min_padding)
+    return [float(vmin - pad), float(vmax + pad)]
 
 # ---------------------------
-# Streamlit Page Config
+# Page Config & Sidebar/Theme
 # ---------------------------
 st.set_page_config(
     page_title="Real-Time Weather Data Dashboard",
     page_icon="🌤️",
-    layout="wide",
+    layout="wide"
 )
-
-# Automatically refresh every 5 seconds
-st_autorefresh(interval=5000, key="data_refresh")
-
-# Render the sidebar
+st_autorefresh(interval=30000, key="data_refresh")
 render_sidebar()
+theme = st.session_state.get("theme", "Dark")
+st.markdown(get_theme_css(theme), unsafe_allow_html=True)
 
-# Get the selected theme from session state
-theme = st.session_state.get('theme', 'Dark')
-css_styles = get_theme_css(theme)
-st.markdown(css_styles, unsafe_allow_html=True)
+# Style checkbox as button‐like toggle
+st.markdown("""
+<style>
+div[data-baseweb="checkbox"] {
+    padding: 0.5em 0.75em;
+    border: 1px solid #888;
+    border-radius: 5px;
+    display: inline-flex;
+    align-items: center;
+    margin-bottom: 1em;
+}
+div[data-baseweb="checkbox"] label {
+    margin: 0;
+    padding-left: 0.5em;
+    font-weight: bold;
+}
+div[data-baseweb="checkbox"] input:checked + label {
+    background-color: #22c55e;
+    color: #fff;
+    padding: 0.2em 0.6em;
+    border-radius: 3px;
+}
+</style>
+""", unsafe_allow_html=True)
 
-# Main title with custom styling
+# ---------------------------
+# Title & Data Fetch
+# ---------------------------
 st.markdown("<h1 class='title'>Real-Time Weather Data Dashboard</h1>", unsafe_allow_html=True)
-
-# Initialize session state variables if not already done
-if 'df' not in st.session_state:
+if "df" not in st.session_state:
     st.session_state.df = pd.DataFrame()
     st.session_state.data_fetched = False
-    st.session_state.last_fetch_time = None  # Will default to 1970-01-01 in the function
+    st.session_state.last_fetch_time = None
 
-# InfluxDB client
 client = get_influxdb_client()
-
-# Update data from InfluxDB Cloud
 update_df_from_db(client)
 
 # ---------------------------
-# Helper Functions
+# Helpers
 # ---------------------------
-def anomaly_count(df, col_name, minutes=30):
-    if df.empty or col_name not in df.columns:
+def anomaly_count(df, col, minutes):
+    if df.empty or col not in df.columns:
         return 0
-    time_threshold = df['Timestamp'].iloc[-1] - pd.Timedelta(minutes=minutes)
-    recent_df = df[df['Timestamp'] >= time_threshold]
-    return int(recent_df[col_name].sum())
+    cutoff = df["Timestamp"].iloc[-1] - pd.Timedelta(minutes=minutes)
+    return int(df[df["Timestamp"] >= cutoff][col].sum())
 
-def get_old_data(df, minutes=30):
-    if df.empty:
-        return None
-    time_diff = pd.Timedelta(minutes=minutes)
-    old_timestamp = df['Timestamp'].iloc[-1] - time_diff
-    old_data = df[df['Timestamp'] <= old_timestamp]
-    if not old_data.empty:
-        return old_data.iloc[-1]
-    else:
-        return None
+def total_rate(df, col):
+    total = int(df[col].sum())
+    span_h = max((df["Timestamp"].iloc[-1] - df["Timestamp"].iloc[0]).total_seconds()/3600, 1)
+    rate = total / span_h * 24
+    return total, rate
+
+def get_old(df, mins=30):
+    cutoff = df["Timestamp"].iloc[-1] - pd.Timedelta(minutes=mins)
+    old = df[df["Timestamp"] <= cutoff]
+    return old.iloc[-1] if not old.empty else None
 
 # ---------------------------
-# Main Logic
+# Main
 # ---------------------------
 if st.session_state.data_fetched and not st.session_state.df.empty:
-    df = st.session_state.df
-    latest_data = df.iloc[-1]
-    old_data = get_old_data(df, minutes=30)
-    
-    # Calculate deltas using aggregated values
-    if old_data is not None:
-        temp_delta = latest_data['temperature_avg'] - old_data['temperature_avg']
-        humidity_delta = latest_data['humidity_avg'] - old_data['humidity_avg']
-        pressure_delta = latest_data['pressure_avg'] - old_data['pressure_avg']
-    else:
-        temp_delta = humidity_delta = pressure_delta = None
+    df = st.session_state.df.copy()
+    latest = df.iloc[-1]
+    old30 = get_old(df, 30)
 
-    # Compute anomaly counts over last 30 minutes
-    temp_anomaly_count = anomaly_count(df, 'temperature_anomaly', minutes=30)
-    humidity_anomaly_count = anomaly_count(df, 'humidity_anomaly', minutes=30)
-    pressure_anomaly_count = anomaly_count(df, 'pressure_anomaly', minutes=30)
+    # deltas
+    temp_delta = latest["temperature_avg"] - old30["temperature_avg"] if old30 is not None else None
+    hum_delta  = latest["humidity_avg"]    - old30["humidity_avg"]    if old30 is not None else None
+    pres_delta = latest["pressure_avg"]    - old30["pressure_avg"]    if old30 is not None else None
 
-    # Display metrics
+    # build metric containers
     col1, col2, col3 = st.columns(3)
-    
-    # Temperature Metric
-    with col1:
-        delta_str = f"{temp_delta:+.2f} °C" if temp_delta is not None else "N/A"
-        if temp_delta is not None:
-            if temp_delta > 0:
-                delta_class = "metric-delta-positive"
-            elif temp_delta < 0:
-                delta_class = "metric-delta-negative"
-            else:
-                delta_class = "metric-delta-neutral"
-        else:
-            delta_class = "metric-delta-neutral"
-        st.markdown(
-            f"""
-            <div class="metric-container">
-                <div class="metric-label">Temperature</div>
-                <div class="metric-value">{latest_data['temperature_avg']:.2f} °C</div>
-                <div class="{delta_class}">Change: {delta_str}</div>
-                <div class="anomaly-metric">Anomalies (30min): {temp_anomaly_count}</div>
-            </div>
-            """,
-            unsafe_allow_html=True
+    for col_box, label, avg_field, delta, anom_col in [
+        (col1, "Temperature", "temperature_avg", temp_delta, "temperature_anomaly"),
+        (col2, "Humidity",    "humidity_avg",    hum_delta,  "humidity_anomaly"),
+        (col3, "Pressure",    "pressure_avg",    pres_delta, "pressure_anomaly"),
+    ]:
+        cnt2, rate = total_rate(df, anom_col)
+        # choose black in Light mode, white in Dark
+        cnt_color = "black" if theme == "Light" else "white"
+
+        unit = "°C" if label=="Temperature" else "%" if label=="Humidity" else "hPa"
+        d_str = f"{delta:+.2f} {unit}" if delta is not None else "N/A"
+        d_class = (
+            "metric-delta-positive" if delta and delta>0 else
+            "metric-delta-negative" if delta and delta<0 else
+            "metric-delta-neutral"
         )
-    
-    # Humidity Metric
-    with col2:
-        delta_str = f"{humidity_delta:+.2f} %" if humidity_delta is not None else "N/A"
-        if humidity_delta is not None:
-            if humidity_delta > 0:
-                delta_class = "metric-delta-positive"
-            elif humidity_delta < 0:
-                delta_class = "metric-delta-negative"
-            else:
-                delta_class = "metric-delta-neutral"
-        else:
-            delta_class = "metric-delta-neutral"
-        st.markdown(
-            f"""
-            <div class="metric-container">
-                <div class="metric-label">Humidity</div>
-                <div class="metric-value">{latest_data['humidity_avg']:.2f} %</div>
-                <div class="{delta_class}">Change: {delta_str}</div>
-                <div class="anomaly-metric">Anomalies (30min): {humidity_anomaly_count}</div>
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
-    
-    # Pressure Metric
-    with col3:
-        delta_str = f"{pressure_delta:+.2f} hPa" if pressure_delta is not None else "N/A"
-        if pressure_delta is not None:
-            if pressure_delta > 0:
-                delta_class = "metric-delta-positive"
-            elif pressure_delta < 0:
-                delta_class = "metric-delta-negative"
-            else:
-                delta_class = "metric-delta-neutral"
-        else:
-            delta_class = "metric-delta-neutral"
-        st.markdown(
-            f"""
-            <div class="metric-container">
-                <div class="metric-label">Pressure</div>
-                <div class="metric-value">{latest_data['pressure_avg']:.2f} hPa</div>
-                <div class="{delta_class}">Change: {delta_str}</div>
-                <div class="anomaly-metric">Anomalies (30min): {pressure_anomaly_count}</div>
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
-    
-    # Plot: Temperature, Humidity, Pressure
-    st.subheader("Temperature, Humidity, and Pressure Over Time")
-    
-    # Plot theme
-    if theme == "Light":
-        plot_bgcolor = 'rgb(240,240,240)'
-        paper_bgcolor = 'rgb(240,240,240)'
-        font_color = 'black'
-    else:
-        plot_bgcolor = 'rgb(17,17,17)'
-        paper_bgcolor = 'rgb(17,17,17)'
-        font_color = 'white'
-    
-    fig = go.Figure()
 
-    # Temperature trace
-    fig.add_trace(go.Scatter(
-        x=df['Timestamp'],
-        y=df['temperature_avg'],
-        mode='lines',
-        name='Temperature (°C)',
-        line=dict(color='red'),
-        yaxis='y1'
-    ))
-    # Temperature anomaly markers -> align with y1
-    temp_anom = df[df['temperature_anomaly'] == 1]
-    if not temp_anom.empty:
-        fig.add_trace(go.Scatter(
-            x=temp_anom['Timestamp'],
-            y=temp_anom['temperature_avg'],
-            mode='markers',
-            name='Temp Anomaly',
-            marker=dict(color='orange', size=10, symbol='x'),
-            yaxis='y1'
-        ))
+        col_box.markdown(f"""
+        <div class="metric-container">
+          <div class="metric-label" style="font-size:1.6em;">{label}</div>
+          <div class="metric-value" style="font-size:2.8em;">{latest[avg_field]:.2f} {unit}</div>
+          <div class="{d_class}" style="font-size:1.4em;">Change: {d_str}</div>
+          <div style="font-size:1.0em; margin-top:8px; color:{cnt_color};">
+            <strong>Anomalies (Last 2 hrs):</strong> {cnt2}&nbsp;&nbsp;
+            <strong>Rate:</strong> {rate:.1f}/day
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
 
-    # Humidity trace
-    fig.add_trace(go.Scatter(
-        x=df['Timestamp'],
-        y=df['humidity_avg'],
-        mode='lines',
-        name='Humidity (%)',
-        line=dict(color='blue'),
-        yaxis='y2'
-    ))
-    # Humidity anomaly markers -> align with y2
-    hum_anom = df[df['humidity_anomaly'] == 1]
-    if not hum_anom.empty:
-        fig.add_trace(go.Scatter(
-            x=hum_anom['Timestamp'],
-            y=hum_anom['humidity_avg'],
-            mode='markers',
-            name='Humidity Anomaly',
-            marker=dict(color='orange', size=10, symbol='x'),
-            yaxis='y2'
-        ))
+    # ——— Extra vertical space before the graph title ———
+    st.markdown("<br><br>", unsafe_allow_html=True)
 
-    # Pressure trace
-    fig.add_trace(go.Scatter(
-        x=df['Timestamp'],
-        y=df['pressure_avg'],
-        mode='lines',
-        name='Pressure (hPa)',
-        line=dict(color='green'),
-        yaxis='y3'
-    ))
-    # Pressure anomaly markers -> align with y3
-    pres_anom = df[df['pressure_anomaly'] == 1]
-    if not pres_anom.empty:
-        fig.add_trace(go.Scatter(
-            x=pres_anom['Timestamp'],
-            y=pres_anom['pressure_avg'],
-            mode='markers',
-            name='Pressure Anomaly',
-            marker=dict(color='orange', size=10, symbol='x'),
-            yaxis='y3'
-        ))
-    
-    # ---------------------------
-    # Manual Range for Each Axis
-    # ---------------------------
-    temp_minmax = axis_range(df['temperature_avg'])
-    hum_minmax = axis_range(df['humidity_avg'])
-    pres_minmax = axis_range(df['pressure_avg'])
+    # plot + toggle
+    plot_col, toggle_col = st.columns([6,2])
+    with plot_col:
+        st.subheader("Temperature, Humidity & Pressure Over Time")
+    with toggle_col:
+        show_anoms = st.checkbox("Show anomaly markers", value=True)
 
-    # Update layout
+    plot_bg = "rgb(240,240,240)" if theme=="Light" else "rgb(17,17,17)"
+    font_c  = "black" if theme=="Light" else "white"
+
+    fig = go.Figure([
+        go.Scatter(x=df["Timestamp"], y=df["temperature_avg"], mode="lines",
+                   name="Temperature (°C)", line=dict(color="red"), yaxis="y1"),
+        go.Scatter(x=df["Timestamp"], y=df["humidity_avg"], mode="lines",
+                   name="Humidity (%)",    line=dict(color="blue"), yaxis="y2"),
+        go.Scatter(x=df["Timestamp"], y=df["pressure_avg"], mode="lines",
+                   name="Pressure (hPa)",  line=dict(color="green"), yaxis="y3"),
+    ])
+
+    if show_anoms:
+        for col_field, color, yax, name in [
+            ("temperature_anomaly","orange","y1","Temp Anomaly"),
+            ("humidity_anomaly",   "orange","y2","Humidity Anomaly"),
+            ("pressure_anomaly",   "orange","y3","Pressure Anomaly"),
+        ]:
+            an = df[df[col_field]==1]
+            if not an.empty:
+                fig.add_trace(go.Scatter(
+                    x=an["Timestamp"],
+                    y=an[col_field.replace("_anomaly","_avg")],
+                    mode="markers",
+                    name=name,
+                    marker=dict(color=color, size=10, symbol="x", opacity=0.6),
+                    yaxis=yax,
+                    hovertemplate="Time: %{x}<br>Value: %{y:.2f}<extra></extra>"
+                ))
+
     fig.update_layout(
-        xaxis=dict(
-            domain=[0.1, 0.9],
-            title='Time',
-            titlefont=dict(color=font_color),
-            tickfont=dict(color=font_color)
-        ),
-        yaxis=dict(
-            title="Temperature (°C)",
-            titlefont=dict(color='red'),
-            tickfont=dict(color='red'),
-            anchor="free",
-            position=0.05,
-            range=temp_minmax  # manual range for temperature
-        ),
-        yaxis2=dict(
-            title="Humidity (%)",
-            titlefont=dict(color='blue'),
-            tickfont=dict(color='blue'),
-            anchor="x",
-            overlaying="y",
-            side="left",
-            position=0,
-            range=hum_minmax  # manual range for humidity
-        ),
-        yaxis3=dict(
-            title="Pressure (hPa)",
-            titlefont=dict(color='green'),
-            tickfont=dict(color='green'),
-            anchor="free",
-            overlaying="y",
-            side="right",
-            position=0.95,
-            range=pres_minmax  # manual range for pressure
-        ),
-        legend=dict(
-            x=0,
-            y=1.1,
-            orientation="h",
-            font=dict(color=font_color)
-        ),
-        plot_bgcolor=plot_bgcolor,
-        paper_bgcolor=paper_bgcolor,
-        font=dict(color=font_color),
+        xaxis=dict(domain=[0.1,0.9], title="Time",
+                   tickfont=dict(color=font_c), titlefont=dict(color=font_c)),
+        yaxis=dict(title="Temp (°C)",    titlefont=dict(color="red"),
+                   tickfont=dict(color="red"), anchor="free",
+                   position=0.05, range=axis_range(df["temperature_avg"])),
+        yaxis2=dict(title="Humidity (%)", titlefont=dict(color="blue"),
+                    tickfont=dict(color="blue"), overlaying="y",
+                    side="left", position=0, range=axis_range(df["humidity_avg"])),
+        yaxis3=dict(title="Pressure (hPa)",titlefont=dict(color="green"),
+                    tickfont=dict(color="green"), overlaying="y",
+                    side="right",position=0.95,range=axis_range(df["pressure_avg"])),
+        plot_bgcolor=plot_bg, paper_bgcolor=plot_bg,
+        legend=dict(x=0, y=1.1, orientation="h", font=dict(color=font_c)),
+        font=dict(color=font_c),
         margin=dict(l=40, r=40, t=40, b=40)
     )
-    
+
     st.plotly_chart(fig, use_container_width=True)
-    
-    # Display timestamp
-    st.write(f"**Last Updated:** {latest_data['Timestamp']}")
-    
-    # Footer
-    st.markdown("<div style='text-align: center; color: gray;'>Data is updated in real-time from the sensors.</div>", unsafe_allow_html=True)
+    st.write(f"**Last Updated:** {latest['Timestamp']}")
+    st.markdown(
+        "<div style='text-align:center;color:gray;'>Data is updated in real-time from the sensors.</div>",
+        unsafe_allow_html=True
+    )
+
 else:
     st.warning("No data available yet.")
-

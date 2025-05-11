@@ -3,167 +3,196 @@ import websockets
 import json
 import time
 import os
-import statistics
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
+from collections import deque
+import statistics
 from influxdb_client import InfluxDBClient, Point
 from influxdb_client.client.write_api import SYNCHRONOUS
 
 # ---------------------------
 # Configuration & InfluxDB Cloud Setup
 # ---------------------------
-AGGREGATION_INTERVAL = 30  # seconds for faster updates
+AGGREGATION_INTERVAL = 30  # seconds per batch
 
-# Sensor-specific anomaly thresholds (z-score thresholds)
-THRESHOLDS = {
-    "temperature": 2.0,    # Small changes are meaningful
-    "humidity": 2.5,       # Medium sensitivity
-    "pressure": 1.8,       # Very stable sensor, stricter threshold
-    "AQI": 3.5,            # Air quality (gas resistance) fluctuates, needs higher threshold
-    "uv_data": 3.5,        # Adjusted to prevent false positives
-    "ambient_light": 3.0   # Large variations due to day-night cycle
+# Pure‑delta thresholds (per 30 s batch)
+DELTA_THRESH = {
+    'temperature': 0.15,  # °C
+    'humidity':    0.85,  # %
+    'pressure':    0.18   # hPa
 }
 
-# InfluxDB Cloud connection details using the new environment variable and URL
-token = os.getenv("INFLUXDB_TOKENCLOUD")
-org = "BTP Project"
-bucket = "Weather Data"
-url = "https://eu-central-1-1.aws.cloud2.influxdata.com"
+# UV‑based “Sunlight Exposure” settings
+UV_SMOOTH_WINDOW    = 21          # rolling median window (~10.5 min)
+UV_ON_THRESHOLD     = 0.85        # uv_data_avg units
+UV_MIN_ON_MINS      = 20          # require ≥20 min
+UV_MIN_ON_SAMPLES   = int((UV_MIN_ON_MINS * 60) / AGGREGATION_INTERVAL)
+UV_DELTA_THRESH     = 2.0         # raw UV jump per batch
 
-client = InfluxDBClient(url=url, token=token, org=org)
+# Ambient‑light “On/Off” settings
+LIGHT_CUTOFF        = 20.0        # lux
+LIGHT_DELTA_THRESH  = 15.0        # lux jump per batch
+
+# InfluxDB Cloud connection
+token    = os.getenv("INFLUXDB_TOKENCLOUD")
+org      = "BTP Project"
+bucket   = "Weather Data"
+url      = "https://eu-central-1-1.aws.cloud2.influxdata.com"
+client   = InfluxDBClient(url=url, token=token, org=org)
 write_api = client.write_api(write_options=SYNCHRONOUS)
 
-# WebSocket URL (remains unchanged)
 WEBSOCKET_URL = "ws://localhost:6789"
 
 # ---------------------------
-# Global storage for historical aggregated averages (for anomaly detection)
+# Streaming State
 # ---------------------------
-historical_data = {
-    "temperature": [],
-    "humidity": [],
-    "pressure": [],
-    "AQI": [],
-    "uv_data": [],
-    "ambient_light": []
+prev_avg = {
+    'temperature':   None,
+    'humidity':      None,
+    'pressure':      None,
+    'uv_data':       None,
+    'ambient_light': None
 }
+uv_deque         = deque(maxlen=UV_SMOOTH_WINDOW)
+uv_run_len       = 0
+last_light_on_ts  = None
+last_light_off_ts = None
+MIN_EVENT_SPACING = AGGREGATION_INTERVAL  # seconds
+ambient_prev_on   = False
 
 # ---------------------------
-# Aggregation Function
+# Aggregation Helper
 # ---------------------------
 def aggregate_buffer(buffer):
     """
-    Compute aggregated average, minimum, and maximum for each sensor from the buffer.
+    Compute avg/min/max for each sensor over buffered interval.
     """
-    aggregated = {}
-    sensors = ["temperature", "humidity", "pressure", "AQI", "uv_data", "ambient_light"]
-    for sensor in sensors:
-        values = [item[sensor] for item in buffer if sensor in item]
-        if values:
-            aggregated[f"{sensor}_avg"] = sum(values) / len(values)
-            aggregated[f"{sensor}_min"] = min(values)
-            aggregated[f"{sensor}_max"] = max(values)
+    agg = {}
+    sensors = ["temperature","humidity","pressure","AQI","uv_data","ambient_light"]
+    for s in sensors:
+        vals = [item[s] for item in buffer if s in item]
+        if vals:
+            agg[f"{s}_avg"] = sum(vals)/len(vals)
+            agg[f"{s}_min"] = min(vals)
+            agg[f"{s}_max"] = max(vals)
         else:
-            aggregated[f"{sensor}_avg"] = None
-            aggregated[f"{sensor}_min"] = None
-            aggregated[f"{sensor}_max"] = None
-    # Set aggregated timestamp as current local time (keep it as a datetime object)
-    local_tz = pytz.timezone("Asia/Kolkata")
-    aggregated["timestamp"] = datetime.now(local_tz)
-    return aggregated
+            agg[f"{s}_avg"] = 0
+            agg[f"{s}_min"] = 0
+            agg[f"{s}_max"] = 0
+
+    # timestamp in IST
+    tz = pytz.timezone("Asia/Kolkata")
+    agg["timestamp"] = datetime.now(tz)
+    return agg
 
 # ---------------------------
-# Anomaly Detection Function (Z-Score Method)
-# ---------------------------
-def detect_anomalies(aggregated):
-    """
-    Uses historical aggregated averages to compute a z-score for each sensor.
-    Flags the sensor as anomalous if its z-score exceeds its specific threshold.
-    """
-    anomalies = {}
-    sensors = ["temperature", "humidity", "pressure", "AQI", "uv_data", "ambient_light"]
-    for sensor in sensors:
-        current_value = aggregated.get(f"{sensor}_avg")
-        history = historical_data[sensor]
-        if history and len(history) >= 2:
-            hist_mean = sum(history) / len(history)
-            hist_std = statistics.stdev(history) if len(history) > 1 else 0.0001
-            z_score = (current_value - hist_mean) / hist_std if hist_std != 0 else 0
-            threshold = THRESHOLDS.get(sensor, 2.0)  # default to 2.0 if not specified
-            anomalies[f"{sensor}_anomaly"] = abs(z_score) > threshold
-        else:
-            anomalies[f"{sensor}_anomaly"] = False  # Not enough history to decide
-    return anomalies
-
-# ---------------------------
-# Main Data Acquisition & Processing Loop
+# Main Loop
 # ---------------------------
 async def fetch_and_process_data():
-    buffer = []
-    start_time = time.time()
+    global uv_run_len, ambient_prev_on, last_light_on_ts, last_light_off_ts
+    buffer   = []
+    start_ts = time.time()
+
     try:
-        async with websockets.connect(WEBSOCKET_URL) as websocket:
+        async with websockets.connect(WEBSOCKET_URL) as ws:
             while True:
-                message = await websocket.recv()
-                data = json.loads(message)
-                # Ensure timestamp is present for each raw reading
+                raw = await ws.recv()
+                data = json.loads(raw)
                 data["timestamp"] = time.strftime("%Y-%m-%d %H:%M:%S")
                 buffer.append(data)
-                
-                # Process the buffered data when aggregation interval has passed
-                if time.time() - start_time >= AGGREGATION_INTERVAL:
-                    aggregated = aggregate_buffer(buffer)
-                    anomalies = detect_anomalies(aggregated)
-                    # Combine aggregated data with anomaly flags
-                    aggregated_record = {**aggregated, **anomalies}
-                    
-                    # Update historical data with the current batch's averages
-                    for sensor in historical_data.keys():
-                        aggregated_value = aggregated.get(f"{sensor}_avg")
-                        if aggregated_value is not None:
-                            historical_data[sensor].append(aggregated_value)
-                            # Limit history length to the last 10 batches
-                            if len(historical_data[sensor]) > 10:
-                                historical_data[sensor].pop(0)
-                    
-                    # Prepare the InfluxDB point with aggregated values and anomaly flags
-                    point = Point("environment") \
-                        .tag("location", "office") \
-                        .field("temperature_avg", aggregated_record.get("temperature_avg", 0)) \
-                        .field("temperature_min", aggregated_record.get("temperature_min", 0)) \
-                        .field("temperature_max", aggregated_record.get("temperature_max", 0)) \
-                        .field("humidity_avg", aggregated_record.get("humidity_avg", 0)) \
-                        .field("humidity_min", aggregated_record.get("humidity_min", 0)) \
-                        .field("humidity_max", aggregated_record.get("humidity_max", 0)) \
-                        .field("pressure_avg", aggregated_record.get("pressure_avg", 0)) \
-                        .field("pressure_min", aggregated_record.get("pressure_min", 0)) \
-                        .field("pressure_max", aggregated_record.get("pressure_max", 0)) \
-                        .field("AQI_avg", aggregated_record.get("AQI_avg", 0)) \
-                        .field("AQI_min", aggregated_record.get("AQI_min", 0)) \
-                        .field("AQI_max", aggregated_record.get("AQI_max", 0)) \
-                        .field("uv_data_avg", aggregated_record.get("uv_data_avg", 0)) \
-                        .field("uv_data_min", aggregated_record.get("uv_data_min", 0)) \
-                        .field("uv_data_max", aggregated_record.get("uv_data_max", 0)) \
-                        .field("ambient_light_avg", aggregated_record.get("ambient_light_avg", 0)) \
-                        .field("ambient_light_min", aggregated_record.get("ambient_light_min", 0)) \
-                        .field("ambient_light_max", aggregated_record.get("ambient_light_max", 0)) \
-                        .field("temperature_anomaly", int(aggregated_record.get("temperature_anomaly"))) \
-                        .field("humidity_anomaly", int(aggregated_record.get("humidity_anomaly"))) \
-                        .field("pressure_anomaly", int(aggregated_record.get("pressure_anomaly"))) \
-                        .field("AQI_anomaly", int(aggregated_record.get("AQI_anomaly"))) \
-                        .field("uv_data_anomaly", int(aggregated_record.get("uv_data_anomaly"))) \
-                        .field("ambient_light_anomaly", int(aggregated_record.get("ambient_light_anomaly"))) \
-                        .time(aggregated_record["timestamp"])
-                    
-                    # Write the aggregated record to InfluxDB Cloud
-                    write_api.write(bucket=bucket, org=org, record=point)
-                    
-                    # Clear the buffer and reset the timer for the next aggregation cycle
+
+                # time to aggregate?
+                if time.time() - start_ts >= AGGREGATION_INTERVAL:
+                    agg = aggregate_buffer(buffer)
+                    now_ts = agg["timestamp"]
+
+                    # pull averages
+                    t_avg  = agg["temperature_avg"]
+                    h_avg  = agg["humidity_avg"]
+                    p_avg  = agg["pressure_avg"]
+                    uv_avg = agg["uv_data_avg"]
+                    lt_avg = agg["ambient_light_avg"]
+
+                    # 1) Pure‑delta anomalies for T/H/P
+                    temp_anom = hum_anom = pres_anom = False
+                    if prev_avg['temperature'] is not None:
+                        if abs(t_avg - prev_avg['temperature']) > DELTA_THRESH['temperature']:
+                            temp_anom = True
+                        if abs(h_avg - prev_avg['humidity']) > DELTA_THRESH['humidity']:
+                            hum_anom = True
+                        if abs(p_avg - prev_avg['pressure']) > DELTA_THRESH['pressure']:
+                            pres_anom = True
+
+                    # compute UV/light delta
+                    uv_delta    = uv_avg - prev_avg['uv_data']       if prev_avg['uv_data']       is not None else 0
+                    light_delta = lt_avg - prev_avg['ambient_light'] if prev_avg['ambient_light'] is not None else 0
+
+                    # update prev_avg
+                    prev_avg['temperature']   = t_avg
+                    prev_avg['humidity']      = h_avg
+                    prev_avg['pressure']      = p_avg
+                    prev_avg['uv_data']       = uv_avg
+                    prev_avg['ambient_light'] = lt_avg
+
+                    # 2) Sunlight Exposure (UV) event
+                    uv_deque.append(uv_avg)
+                    uv_smooth = statistics.median(uv_deque)
+                    if uv_smooth >= UV_ON_THRESHOLD:
+                        uv_run_len += 1
+                    else:
+                        uv_run_len = 0
+                    sustained_uv = (uv_run_len == UV_MIN_ON_SAMPLES)
+                    delta_uv     = (uv_delta >= UV_DELTA_THRESH)
+                    uv_event     = int(sustained_uv or delta_uv)
+
+                    # 3) Ambient Light On/Off events
+                    on_mask    = lt_avg >= LIGHT_CUTOFF
+                    rise_edge  = on_mask and not ambient_prev_on
+                    delta_on   = (light_delta >= LIGHT_DELTA_THRESH)
+                    raw_on     = rise_edge or delta_on
+                    raw_off    = ((not on_mask) and ambient_prev_on) or (light_delta <= -LIGHT_DELTA_THRESH)
+
+                    light_on_event = 0
+                    if raw_on and (
+                        last_light_on_ts is None or
+                        (now_ts - last_light_on_ts).total_seconds() >= MIN_EVENT_SPACING
+                    ):
+                        light_on_event  = 1
+                        last_light_on_ts = now_ts
+
+                    light_off_event = 0
+                    if raw_off and (
+                        last_light_off_ts is None or
+                        (now_ts - last_light_off_ts).total_seconds() >= MIN_EVENT_SPACING
+                    ):
+                        light_off_event  = 1
+                        last_light_off_ts = now_ts
+
+                    ambient_prev_on = on_mask
+
+                    # 4) Build & write InfluxDB point
+                    pt = Point("environment").tag("location","office")
+                    # agg fields
+                    pt.field("temperature_avg", t_avg).field("temperature_min", agg["temperature_min"]).field("temperature_max", agg["temperature_max"])
+                    pt.field("humidity_avg",    h_avg).field("humidity_min",    agg["humidity_min"]).field("humidity_max",    agg["humidity_max"])
+                    pt.field("pressure_avg",    p_avg).field("pressure_min",    agg["pressure_min"]).field("pressure_max",    agg["pressure_max"])
+                    # raw IAQ
+                    pt.field("AQI_avg",         agg["AQI_avg"]).field("AQI_min",         agg["AQI_min"]).field("AQI_max",         agg["AQI_max"])
+                    # UV/light raw
+                    pt.field("uv_data_avg",     uv_avg).field("uv_data_min",     agg["uv_data_min"]).field("uv_data_max",     agg["uv_data_max"])
+                    pt.field("ambient_light_avg", lt_avg).field("ambient_light_min", agg["ambient_light_min"]).field("ambient_light_max", agg["ambient_light_max"])
+                    # anomaly/events
+                    pt.field("temperature_anomaly", int(temp_anom)).field("humidity_anomaly", int(hum_anom)).field("pressure_anomaly", int(pres_anom))
+                    pt.field("sunlight_exposure",   uv_event).field("light_on_event",    light_on_event).field("light_off_event",   light_off_event)
+                    pt.time(agg["timestamp"])
+                    write_api.write(bucket=bucket, org=org, record=pt)
+
+                    # reset
                     buffer.clear()
-                    start_time = time.time()
-                
-                # Yield control briefly
+                    start_ts = time.time()
+
                 await asyncio.sleep(0.1)
+
     except Exception as e:
         print(f"Error in data processing: {e}")
     finally:
@@ -171,4 +200,3 @@ async def fetch_and_process_data():
 
 if __name__ == "__main__":
     asyncio.run(fetch_and_process_data())
-

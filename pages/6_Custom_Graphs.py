@@ -87,7 +87,7 @@ if st.session_state.data_fetched and not st.session_state.df.empty:
         if metric_x == "Time":
             metrics_y_options = [m for m in friendly_to_column.keys() if m != "Time"]
         else:
-            metrics_y_options = [m for m in friendly_to_column.keys() if m not in [metric_x]]
+            metrics_y_options = [m for m in friendly_to_column.keys() if m not in [metric_x, "Time"]]
         metric_y = st.selectbox('Select Y-axis Metric', metrics_y_options)
 
     plot_type = st.selectbox('Select Plot Type', ['Line Plot', 'Scatter Plot', 'Bar Chart', 'Correlation Plot'])

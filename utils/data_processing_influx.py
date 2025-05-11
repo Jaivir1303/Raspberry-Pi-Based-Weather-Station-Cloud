@@ -209,6 +209,8 @@ def heat_index_description(heat_index):
     else:
         return "Comfortable 😊"
 
+
+
 # ---------------------------
 # IAQ Functions
 # ---------------------------
@@ -217,10 +219,6 @@ def get_iaq_generator():
     return IAQGenerator()
 
 def calculate_iaq(r_gas, humidity):
-    """
-    Calculates the next IAQ value only when the gas resistance has changed.
-    Uses session_state to store the current generator, last gas resistance, and last IAQ.
-    """
     if 'iaq_generator' not in st.session_state:
         st.session_state.iaq_generator = get_iaq_generator()
     if 'last_gas_resistance' not in st.session_state:
@@ -236,14 +234,9 @@ def calculate_iaq(r_gas, humidity):
     return iaq
 
 def update_iaq_values(df):
-    """
-    Updates the session state IAQ values list for new rows in the DataFrame.
-    Assumes that df is sorted by Timestamp.
-    """
     if 'iaq_values' not in st.session_state:
         st.session_state.iaq_values = []
     n_existing = len(st.session_state.iaq_values)
-    # For every new row (in sorted order), calculate and append a new IAQ value.
     for i in range(n_existing, len(df)):
         r_gas = df.loc[i, 'gas_resistance']
         humidity = df.loc[i, 'humidity']
@@ -251,11 +244,22 @@ def update_iaq_values(df):
         st.session_state.iaq_values.append(iaq)
 
 # ---------------------------
-# Theme CSS Function (Extended with anomaly metric styling)
+# Event Counting Helper
+# ---------------------------
+def count_events(df, col_name, minutes=30):
+    if df.empty or col_name not in df.columns:
+        return 0
+    time_threshold = df['Timestamp'].iloc[-1] - pd.Timedelta(minutes=minutes)
+    recent = df[df['Timestamp'] >= time_threshold]
+    return int(recent[col_name].sum())
+
+# ---------------------------
+# Theme CSS Function (Extended with anomaly & event styling)
 # ---------------------------
 def get_theme_css(theme):
     """
-    Returns CSS styles based on the selected theme.
+    Returns CSS styles based on the selected theme, including
+    styled checkbox toggles as button‐like controls.
     """
     if theme == "Light":
         background_color = "#FFFFFF"
@@ -418,7 +422,27 @@ def get_theme_css(theme):
         color: red;
         margin-top: 5px;
     }}
+
+    /* Checkbox-as-button styling */
+    div[data-baseweb="checkbox"] {{
+        padding: 0.5em 0.75em;
+        border: 1px solid #888;
+        border-radius: 5px;
+        display: inline-flex;
+        align-items: center;
+        margin-bottom: 1em;
+    }}
+    div[data-baseweb="checkbox"] label {{
+        margin: 0;
+        padding-left: 0.5em;
+        font-weight: bold;
+    }}
+    div[data-baseweb="checkbox"] input:checked + label {{
+        background-color: #22c55e;
+        color: #fff;
+        padding: 0.2em 0.6em;
+        border-radius: 3px;
+    }}
     </style>
     """
     return css
-
