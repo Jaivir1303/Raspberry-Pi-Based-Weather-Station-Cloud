@@ -1,0 +1,86 @@
+    delta_H = pred_H - latest["humidity_avg"]
+    delta_P = pred_P - latest["pressure_avg"]
+
+    # ─ Metric Cards ─
+    col1, col2, col3 = st.columns(3)
+    for box, label, cur, pred, delta, unit in [
+        (col1, "Temperature", latest["temperature_avg"], pred_T, delta_T, "°C"),
+        (col2, "Humidity",    latest["humidity_avg"],    pred_H, delta_H, "%"),
+        (col3, "Pressure",    latest["pressure_avg"],    pred_P, delta_P, "hPa"),
+    ]:
+        d_class = (
+            "metric-delta-positive" if delta > 0
+            else "metric-delta-negative" if delta < 0
+            else "metric-delta-neutral"
+        )
+        box.markdown(f"""
+        <div class="metric-container">
+          <div class="metric-label"  style="font-size:1.2em;">{label}</div>
+          <div class="metric-value"  style="font-size:2.5em;">{cur:.2f} {unit}</div>
+          <div class="{d_class}"     style="font-size:1.1em;">
+            +{horiz} Forecast: {pred:.2f} {unit} <br>
+            Δ: {delta:+.2f} {unit}
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown("---")
+
+    # ─ Plotly Chart ─
+    fig = go.Figure()
+
+    # Historical traces
+    fig.add_trace(go.Scatter(
+        x=df_hist["Timestamp"], y=df_hist["temperature_avg"],
+        mode="lines", name="Temp (hist)", line=dict(color="red"), yaxis="y1"))
+    fig.add_trace(go.Scatter(
+        x=df_hist["Timestamp"], y=df_hist["humidity_avg"],
+        mode="lines", name="Humidity (hist)", line=dict(color="blue"), yaxis="y2"))
+    fig.add_trace(go.Scatter(
+        x=df_hist["Timestamp"], y=df_hist["pressure_avg"],
+        mode="lines", name="Pressure (hist)", line=dict(color="green"), yaxis="y3"))
+
+    # Forecast traces (dashed)
+    fig.add_trace(go.Scatter(
+        x=fc_df["Timestamp"], y=fc_df["temperature_fc"],
+        mode="lines", name="Temp (forecast)", line=dict(color="red", dash="dash"), yaxis="y1"))
+    fig.add_trace(go.Scatter(
+        x=fc_df["Timestamp"], y=fc_df["humidity_fc"],
+        mode="lines", name="Humidity (forecast)", line=dict(color="blue", dash="dash"), yaxis="y2"))
+    fig.add_trace(go.Scatter(
+        x=fc_df["Timestamp"], y=fc_df["pressure_fc"],
+        mode="lines", name="Pressure (forecast)", line=dict(color="green", dash="dash"), yaxis="y3"))
+
+    # "Now" marker
+    now_x = latest["Timestamp"]
+    fig.add_vline(x=now_x, line=dict(color="gray", width=1, dash="dot"), annotation_text="Now",
+                  annotation_position="top left", annotation_font_color=axis_c)
+
+    # Layout
+    fig.update_layout(
+        xaxis=dict(domain=[0.1, 0.9], title="Time",
+                   tickfont=dict(color=axis_c), titlefont=dict(color=axis_c)),
+        yaxis=dict(title="Temp (°C)", titlefont=dict(color="red"),
+                   tickfont=dict(color="red"), anchor="free", position=0.05,
+                   range=axis_range(pd.concat([df_hist["temperature_avg"], fc_df["temperature_fc"]]))),
+        yaxis2=dict(title="Humidity (%)", titlefont=dict(color="blue"),
+                    tickfont=dict(color="blue"), overlaying="y", side="left", position=0,
+                    range=axis_range(pd.concat([df_hist["humidity_avg"], fc_df["humidity_fc"]]))),
+        yaxis3=dict(title="Pressure (hPa)", titlefont=dict(color="green"),
+                    tickfont=dict(color="green"), overlaying="y", side="right", position=0.95,
+                    range=axis_range(pd.concat([df_hist["pressure_avg"], fc_df["pressure_fc"]]))),
+        plot_bgcolor=bg_color, paper_bgcolor=bg_color,
+        font=dict(color=axis_c),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        margin=dict(l=40, r=40, t=30, b=40),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.write(f"**Last Updated:** {latest['Timestamp']}")
+    st.markdown(
+        f"<div style='text-align:center;color:gray;'>Model: ARIMA(2,1,2) for Temp/Press, "
+        f"ARIMA(2,0,2) for Humidity &nbsp; | &nbsp; Horizon: {horiz}</div>",
+        unsafe_allow_html=True,
+    )
+else:
+    st.warning("No data available yet.")

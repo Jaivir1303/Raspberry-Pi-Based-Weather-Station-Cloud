@@ -27,6 +27,7 @@ GitPython==3.1.43
 idna==3.8
 influxdb_client==1.47.0
 Jinja2==3.1.4
+joblib==1.5.0
 jsonschema==4.23.0
 jsonschema-specifications==2023.12.1
 kiwisolver==1.4.5
@@ -40,6 +41,7 @@ numpy==2.1.0
 packaging==24.1
 paho-mqtt==2.1.0
 pandas==2.2.2
+pathlib==1.0.1
 patsy==0.5.6
 pillow==10.4.0
 plotly==5.24.0

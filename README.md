@@ -1,0 +1,1 @@
+This Project is for an IoT-based Weather Station and Dashboard. This contains 2 scripts made for reading data from environmental sensors and storing it in an InfluxDB database, aswell as the code for a streamlit dashboard split across multiple pages with processing handed off to a util script.

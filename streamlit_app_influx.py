@@ -5,6 +5,12 @@ import time
 from streamlit_autorefresh import st_autorefresh
 from utils.data_processing_influx import get_influxdb_client, update_df_from_db, get_theme_css
 from utils.sidebar import render_sidebar
+# --- Silence statsmodels “No supported index” warnings ---
+import warnings
+from statsmodels.tools.sm_exceptions import ValueWarning
+warnings.filterwarnings("ignore", category=ValueWarning)
+warnings.filterwarnings("ignore", category=FutureWarning,
+                        message="No supported index is available")
 
 # ---------------------------
 # Utility Function for Manual Ranges
